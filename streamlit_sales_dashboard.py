@@ -727,13 +727,13 @@ with tab2:
     if run_gemini:
         if gemini_key:
             user_prompt = f"""You are a senior credit & receivables analyst.
-Given the attached/inline analysis_input.md (KPIs, trends, top-risk customers, and a 3-month forecast), deliver:
+based on the receivables, sales and collection data you have analysed, provide the following
 
-1) Executive Summary (bullets, focus on movement vs last 3–6–12 months)
+1) Executive Summary (Overall receivables, Trend in DSO, High risk and Low risk features, Any abnormal trend in ageing)
 2) Top 10 Risky Customers (1–2 lines each: why risky, quant evidence, suggested action)
-3) Recommended Actions for next 30/60/90 days (specific, prioritized)
-4) Cash flow outlook & implications (best/base/worst if applicable)
-5) Open questions / data gaps that would improve precision
+3) Pareto analysis of receivables, riskiness in the view of industry/ customer category concentration, default probability, 
+4) Sales person analysis ( Additional sales bought in, colleciton efficiency)
+5)Aread need key attention
 
 Rules:
 - Base everything strictly on the provided numbers; do not invent figures.
