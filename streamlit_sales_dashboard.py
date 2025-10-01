@@ -8,6 +8,8 @@ Upgraded Streamlit Sales & Collections Dashboard (Gemini SDK integrated)
 - Uses google-generativeai SDK for Gemini calls.
 - Install: pip install google-generativeai
 - Set GEMINI_API_KEY in your environment or paste the key in the Gemini input box in-app.
+- Added forecasts for sales and collections for next 7, 30, 60 days using daily time series and GradientBoostingRegressor.
+- Added logistic regression based risk scoring and default probabilities.
 """
 
 import streamlit as st
@@ -23,6 +25,7 @@ import plotly.graph_objects as go
 
 # ML
 from sklearn.ensemble import IsolationForest, GradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression
 
 # PPTX (optional)
 try:
@@ -104,18 +107,22 @@ def compute_kpis(merged, ref_date=CURRENT_DATE):
     overdue_60 = merged[merged['DaysOverdue'] >= 60]['Outstanding'].sum() / outstanding if outstanding else 0
     overdue_90 = merged[merged['DaysOverdue'] >= 90]['Outstanding'].sum() / outstanding if outstanding else 0
     
-    # Bad Debt Reserve
-    risk_factors = {'Current': 0.01, '1-30': 0.05, '31-60': 0.1, '61-90': 0.2, '90+': 0.5}
-    if 'AgingBucket' in merged.columns:
-        merged['Reserve'] = merged.apply(lambda r: r['Outstanding'] * risk_factors.get(r['AgingBucket'], 0), axis=1)
+    # Bad Debt Reserve (model-based using logistic prob_default)
+    if 'prob_default' in merged.columns:
+        merged['Reserve'] = merged['Outstanding'] * merged['prob_default']
         bad_debt_reserve = merged['Reserve'].sum()
     else:
-        st.warning("AgingBucket column missing; bad debt reserve set to 0.")
-        bad_debt_reserve = 0
+        st.warning("prob_default column missing; using rule-based bad debt reserve.")
+        risk_factors = {'Current': 0.01, '1-30': 0.05, '31-60': 0.1, '61-90': 0.2, '90+': 0.5}
+        if 'AgingBucket' in merged.columns:
+            merged['Reserve'] = merged.apply(lambda r: r['Outstanding'] * risk_factors.get(r['AgingBucket'], 0), axis=1)
+            bad_debt_reserve = merged['Reserve'].sum()
+        else:
+            bad_debt_reserve = 0
     bad_debt_pct = (bad_debt_reserve / outstanding) * 100 if outstanding else 0
     
     # Cash at Risk
-    cash_at_risk = bad_debt_reserve  # Simplified: use reserve as proxy if no aging buckets
+    cash_at_risk = bad_debt_reserve  # Use reserve as proxy
     
     # Collections Efficiency
     collections_efficiency = collection_rate
@@ -146,6 +153,41 @@ def run_isolation_forest(df, feature_cols=['Amount','Outstanding','DaysOverdue']
     df['is_anomaly'] = preds == -1
     return df.sort_values('anomaly_score')
 
+def compute_default_probs(merged, ref_date=CURRENT_DATE):
+    df = merged.copy()
+    # Define cutoff for training: invoices due at least 30 days ago
+    cut_off = ref_date - timedelta(days=30)
+    train_df = df[df['DueDate'] < cut_off].copy()
+    if train_df.empty:
+        df['prob_default'] = 0.0
+        return df
+    # Target: 1 if still outstanding (assumed default for old invoices)
+    train_df['is_default'] = (train_df['Outstanding'] > 0).astype(int)
+    # Features: Amount, Category (one-hot if present)
+    features = ['Amount']
+    if 'Category' in train_df.columns:
+        cat_dummies = pd.get_dummies(train_df['Category'], prefix='Cat')
+        train_df = pd.concat([train_df, cat_dummies], axis=1)
+        features += cat_dummies.columns.tolist()
+    X_train = train_df[features].fillna(0)
+    y_train = train_df['is_default']
+    if y_train.nunique() < 2:
+        df['prob_default'] = 0.0
+        return df
+    model = LogisticRegression(random_state=42, max_iter=1000)
+    model.fit(X_train, y_train)
+    # Predict on all
+    X_all = df[['Amount']].fillna(0)
+    if 'Category' in df.columns:
+        cat_dummies_all = pd.get_dummies(df['Category'], prefix='Cat')
+        for col in cat_dummies.columns:
+            if col not in cat_dummies_all.columns:
+                cat_dummies_all[col] = 0
+        cat_dummies_all = cat_dummies_all[cat_dummies.columns]
+        X_all = pd.concat([X_all, cat_dummies_all], axis=1)
+    df['prob_default'] = model.predict_proba(X_all)[:, 1]
+    return df
+
 def compute_risk_score_table(cust_df, merged_df):
     df = cust_df.copy()
     eps = 1e-9
@@ -167,12 +209,20 @@ def compute_risk_score_table(cust_df, merged_df):
     if 'collection_rate' not in df.columns:
         df['collection_rate'] = (df.get('collected',0) / (df.get('total_invoiced', df['outstanding']) + eps)).fillna(0)
 
+    # Incorporate default prob (aggregated)
+    if 'prob_default' in merged_df.columns:
+        avg_prob = merged_df.groupby('CustomerID')['prob_default'].mean().rename('avg_prob_default').reset_index()
+        df = df.merge(avg_prob, on='CustomerID', how='left').fillna({'avg_prob_default': 0})
+    else:
+        df['avg_prob_default'] = 0
+
     df['z_outstanding'] = (df['outstanding'] - df['outstanding'].mean())/(df['outstanding'].std()+eps)
     df['z_overdue'] = (df['overdue_intensity'] - df['overdue_intensity'].mean())/(df['overdue_intensity'].std()+eps)
     df['z_collection'] = (df['collection_rate'].mean() - df['collection_rate'])/(df['collection_rate'].std()+eps)
+    df['z_prob'] = (df['avg_prob_default'] - df['avg_prob_default'].mean()) / (df['avg_prob_default'].std() + eps)
 
-    w_out, w_over, w_col = 0.5, 0.3, 0.2
-    df['risk_score'] = (w_out * df['z_outstanding'] + w_over * df['z_overdue'] + w_col * df['z_collection']).fillna(0)
+    w_out, w_over, w_col, w_prob = 0.4, 0.3, 0.2, 0.1
+    df['risk_score'] = (w_out * df['z_outstanding'] + w_over * df['z_overdue'] + w_col * df['z_collection'] + w_prob * df['z_prob']).fillna(0)
     df = df.sort_values('risk_score', ascending=False)
 
     def reason(r):
@@ -183,6 +233,8 @@ def compute_risk_score_table(cust_df, merged_df):
             parts.append(f"Long overdue (intensity {int(r['overdue_intensity'])})")
         if r['collection_rate'] < 0.6:
             parts.append(f"Low collection rate {r['collection_rate']:.0%}")
+        if 'avg_prob_default' in r and r['avg_prob_default'] > 0.5:
+            parts.append(f"High default prob {r['avg_prob_default']:.0%}")
         return '; '.join(parts) or 'No material issues'
     df['reason'] = df.apply(reason, axis=1)
     return df
@@ -256,6 +308,66 @@ def forecast_receivables_gb(monthly_df, n_periods=3):
         cur['MonthEnd'] = next_month_ts
     return pd.DataFrame(preds)
 
+def daily_invoiced_series(invoices_df, start_date=None, end_date=CURRENT_DATE):
+    inv = invoices_df.copy()
+    inv['Date'] = inv['InvoiceDate'].dt.normalize()
+    daily = inv.groupby('Date')['Amount'].sum().reset_index(name='Invoiced')
+    if start_date is None:
+        start_date = daily['Date'].min()
+    full_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    daily = pd.DataFrame({'Date': full_dates}).merge(daily, on='Date', how='left').fillna({'Invoiced': 0})
+    return daily
+
+def daily_collections_series(collections_df, start_date=None, end_date=CURRENT_DATE):
+    coll = collections_df.copy()
+    coll['Date'] = coll['PaymentDate'].dt.normalize()
+    daily = coll.groupby('Date')['Collection'].sum().reset_index(name='Collected')
+    if start_date is None:
+        start_date = daily['Date'].min()
+    full_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    daily = pd.DataFrame({'Date': full_dates}).merge(daily, on='Date', how='left').fillna({'Collected': 0})
+    return daily
+
+def forecast_daily_gb(daily_df, target, n_periods=60):
+    df = daily_df.copy().sort_values('Date').reset_index(drop=True)
+    df['y'] = df[target]
+    for lag in range(1, 8):
+        df[f'lag_{lag}'] = df['y'].shift(lag)
+    df['dayofweek'] = df['Date'].dt.dayofweek
+    df['dayofmonth'] = df['Date'].dt.day
+    df['month'] = df['Date'].dt.month
+    df_nonull = df.dropna().reset_index(drop=True)
+    if df_nonull.shape[0] < 10:
+        avg = df_nonull['y'].mean() if not df_nonull.empty else 0
+        future_dates = [df['Date'].max() + timedelta(days=i) for i in range(1, n_periods + 1)] if not df.empty else [CURRENT_DATE + timedelta(days=i) for i in range(1, n_periods + 1)]
+        return pd.DataFrame({'Date': future_dates, f'Forecast{target}': [avg] * n_periods})
+    feat_cols = [f'lag_{i}' for i in range(1, 8)] + ['dayofweek', 'dayofmonth', 'month']
+    X, y = df_nonull[feat_cols], df_nonull['y']
+    model = GradientBoostingRegressor(n_estimators=200, random_state=42)
+    model.fit(X, y)
+    cur = df_nonull.iloc[-1].copy()
+    preds = []
+    cur_feats = {col: cur[col] for col in feat_cols}
+    cur_date = cur['Date']
+    for i in range(1, n_periods + 1):
+        next_date = cur_date + timedelta(days=1)
+        cur_feats['dayofweek'] = next_date.dayofweek
+        cur_feats['dayofmonth'] = next_date.day
+        cur_feats['month'] = next_date.month
+        Xn = pd.DataFrame([cur_feats])
+        pred = max(0, model.predict(Xn)[0])
+        preds.append({'Date': next_date, f'Forecast{target}': pred})
+        for j in range(7, 1, -1):
+            cur_feats[f'lag_{j}'] = cur_feats[f'lag_{j-1}']
+        cur_feats['lag_1'] = pred
+        cur_date = next_date
+    return pd.DataFrame(preds)
+
+def sum_forecast(forecast_df, col, days):
+    if forecast_df.empty:
+        return 0
+    return forecast_df.head(days)[col].sum()
+
 def concentration_metrics(cust_summary, top_n=3):
     total = cust_summary['total_invoiced'].sum() if 'total_invoiced' in cust_summary.columns else cust_summary['outstanding'].sum()
     if 'total_invoiced' in cust_summary.columns:
@@ -269,7 +381,7 @@ def concentration_metrics(cust_summary, top_n=3):
     hhi = (csum['share'] ** 2).sum()
     return {'top_n_share': top_share, 'hhi': hhi}
 
-def build_analysis_input_md(kpis, monthly, mer_rcv, dso_trend, top_risks_df, forecast_df):
+def build_analysis_input_md(kpis, monthly, mer_rcv, dso_trend, top_risks_df, forecast_df, sales_7, sales_30, sales_60, coll_7, coll_30, coll_60):
     lines = []
     lines.append("# analysis_input.md — Credit & Receivables Snapshot\n")
     lines.append("## KPIs")
@@ -293,6 +405,13 @@ def build_analysis_input_md(kpis, monthly, mer_rcv, dso_trend, top_risks_df, for
     lines.append("\n## 3-month Forecast (Receivables)")
     for r in forecast_df.itertuples():
         lines.append(f"- {r.MonthEnd.strftime('%Y-%m-%d')}: Forecast Receivables ₹{r.ForecastReceivables:,.0f}")
+    lines.append("\n## Short-term Forecasts")
+    lines.append(f"- Next 7 days sales: ₹{sales_7:,.0f}")
+    lines.append(f"- Next 30 days sales: ₹{sales_30:,.0f}")
+    lines.append(f"- Next 60 days sales: ₹{sales_60:,.0f}")
+    lines.append(f"- Next 7 days collections: ₹{coll_7:,.0f}")
+    lines.append(f"- Next 30 days collections: ₹{coll_30:,.0f}")
+    lines.append(f"- Next 60 days collections: ₹{coll_60:,.0f}")
     return "\n".join(lines)
 
 def compute_cohort_analysis(merged):
@@ -482,7 +601,10 @@ if product_line_filter and 'ProductLine' in merged.columns:
 # Compute aging buckets first to ensure AgingBucket column exists
 aging_agg, merged = aging_buckets(merged, ref_date=CURRENT_DATE)
 
-# Compute KPIs after aging buckets
+# Compute default probabilities using logistic regression
+merged = compute_default_probs(merged)
+
+# Compute KPIs after aging buckets and probs
 kpis = compute_kpis(merged)
 
 sp_summary = merged.groupby('salesperson').agg(total_invoiced=('Amount','sum'), collected=('Collected','sum'), outstanding=('Outstanding','sum')).reset_index()
@@ -516,6 +638,19 @@ for _, r in mer_rcv.iterrows():
     dso_rows.append({'MonthEnd': me, 'Receivables': r['Receivables'], 'DSO': dso_me})
 dso_trend = pd.DataFrame(dso_rows)
 
+# Daily forecasts
+daily_inv = daily_invoiced_series(invoices, start_date=start_date)
+forecast_inv = forecast_daily_gb(daily_inv, 'Invoiced', n_periods=60)
+daily_coll = daily_collections_series(collections, start_date=start_date)
+forecast_coll = forecast_daily_gb(daily_coll, 'Collected', n_periods=60)
+
+sales_7 = sum_forecast(forecast_inv, 'ForecastInvoiced', 7)
+sales_30 = sum_forecast(forecast_inv, 'ForecastInvoiced', 30)
+sales_60 = sum_forecast(forecast_inv, 'ForecastInvoiced', 60)
+coll_7 = sum_forecast(forecast_coll, 'ForecastCollected', 7)
+coll_30 = sum_forecast(forecast_coll, 'ForecastCollected', 30)
+coll_60 = sum_forecast(forecast_coll, 'ForecastCollected', 60)
+
 # Anomalies
 try:
     merged_af = merged.copy()
@@ -539,10 +674,10 @@ cohort_retention = compute_cohort_analysis(merged)
 # Waterfall
 ar_waterfall = compute_ar_waterfall(mer_rcv, monthly)
 
-# Forecast
+# Forecast (monthly receivables)
 forecast_df = forecast_receivables_gb(mer_rcv, n_periods=3)
 
-# Risk scoring
+# Risk scoring (with logistic probs)
 risk_tbl = compute_risk_score_table(cust_summary, merged)
 
 # Alerts
@@ -600,6 +735,22 @@ with kpi_cols2[1]:
     color = "green" if kpis['collections_efficiency'] > 0.9 else "amber" if kpis['collections_efficiency'] > 0.7 else "red"
     st.metric("Collections Efficiency", f"{kpis['collections_efficiency']:.1%}", delta=0, help="% collected vs billed")
     st.markdown(f"<span style='color:{color}'>**Action**: Improve collection processes.</span>", unsafe_allow_html=True)
+
+# Short-term forecast KPIs
+st.subheader("Short-term Forecasts")
+forecast_cols = st.columns(6)
+with forecast_cols[0]:
+    st.metric("Sales Next 7d", f"₹{sales_7:,.0f}")
+with forecast_cols[1]:
+    st.metric("Sales Next 30d", f"₹{sales_30:,.0f}")
+with forecast_cols[2]:
+    st.metric("Sales Next 60d", f"₹{sales_60:,.0f}")
+with forecast_cols[3]:
+    st.metric("Collections Next 7d", f"₹{coll_7:,.0f}")
+with forecast_cols[4]:
+    st.metric("Collections Next 30d", f"₹{coll_30:,.0f}")
+with forecast_cols[5]:
+    st.metric("Collections Next 60d", f"₹{coll_60:,.0f}")
 
 # Two-column body
 left_col, right_col = st.columns(2)
@@ -721,7 +872,7 @@ with tab2:
     available_models = list_available_gemini_models(gemini_key)
     selected_model = st.selectbox("Select Gemini Model", options=available_models if available_models else ["gemini-1.5-flash"], index=0)
     run_gemini = st.button("Generate CFO analysis (Gemini)", key='run_gemini')
-    analysis_md = build_analysis_input_md(kpis, monthly, mer_rcv, dso_trend, risk_tbl, forecast_df)
+    analysis_md = build_analysis_input_md(kpis, monthly, mer_rcv, dso_trend, risk_tbl, forecast_df, sales_7, sales_30, sales_60, coll_7, coll_30, coll_60)
     st.download_button("Download analysis_input.md", data=analysis_md, file_name="analysis_input.md", mime="text/markdown", key='download_analysis_md')
     st.text_area("analysis_input.md (preview)", value=analysis_md, height=300)
     if run_gemini:
@@ -771,6 +922,10 @@ with tab3:
     st.dataframe(forecast_df.style.format({'ForecastReceivables':'{0:,.0f}'}), use_container_width=True)
     st.download_button("Download forecast CSV (extra)", data=forecast_df.to_csv(index=False).encode('utf-8'), file_name='receivables_forecast_extra.csv', mime='text/csv', key='download_forecast_tab3')
     st.download_button("Export Dashboard Snapshot (PDF)", data="placeholder.pdf", file_name="dashboard_snapshot.pdf")  # Placeholder for PDF export
+    st.subheader("Daily Sales Forecast")
+    st.dataframe(forecast_inv)
+    st.subheader("Daily Collections Forecast")
+    st.dataframe(forecast_coll)
 
 # Footer
 st.markdown("---")
